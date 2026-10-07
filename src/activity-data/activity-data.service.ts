@@ -1,5 +1,4 @@
 import { Injectable, Module } from '@nestjs/common';
-import { PoolClient } from 'pg';
 import { DbModule, DbService, type Queryer } from '../database/database.module';
 import { Fraction } from '../common/fraction';
 import { ConflictError, FieldError, NotFoundError, ValidationException } from '../common/errors';
@@ -62,6 +61,24 @@ interface StoredRecord {
   is_correction: boolean;
   supersedes_record_no: string | null;
   created_at: Date;
+  import_batch_id: string;
+}
+
+/**
+ * How a cut defines which records belong to it:
+ *  - 'timestamp': legacy/manual semantics, created_at <= as_of (wall clock);
+ *  - 'committed': the batch set frozen at cut creation (commit-serial), used by
+ *    createCutNow() and monthly closes. Its membership can never change
+ *    afterwards (see migration 0002).
+ */
+export type CutMode = 'timestamp' | 'committed';
+
+export interface CutInfo {
+  id: number;
+  mode: CutMode;
+  /** Wall-clock boundary, present only for timestamp cuts. */
+  asOf: Date | null;
+  label: string | null;
 }
 
 function monthToString(d: Date): string {
@@ -73,6 +90,8 @@ export interface ActivityRecord extends Omit<ActivityInput, 'supersedesRecordNo'
   isCorrection: boolean;
   supersedesRecordNo: string | null;
   createdAt: Date;
+  /** Commit-serial id of the import transaction that inserted this record. */
+  importBatchId: bigint;
 }
 
 function hydrate(r: StoredRecord): ActivityRecord {
@@ -88,7 +107,8 @@ function hydrate(r: StoredRecord): ActivityRecord {
     unit: r.unit,
     isCorrection: r.is_correction,
     supersedesRecordNo: r.supersedes_record_no,
-    createdAt: r.created_at
+    createdAt: r.created_at,
+    importBatchId: BigInt(r.import_batch_id)
   };
 }
 
@@ -237,6 +257,22 @@ export class ActivityDataService {
   // --------------------------------------------------------------------------
 
   async bulkImport(input: BulkImportInput): Promise<ImportResultItem[]> {
+    return this.db.withTransaction((client) => this.bulkImportOn(client, input));
+  }
+
+  /**
+   * Import core bound to an already-open transaction on `client`.
+   *
+   * The transaction is the atomic *import batch*: every accepted row commits
+   * together or none does. A row in `activity_import_batches` is allocated in
+   * this same transaction, so its existence outside the transaction is exactly
+   * equivalent to "this import committed" and its sequence number is a commit
+   * serial (gaps from rolled-back transactions never matter).
+   *
+   * Accepting a caller-provided client also lets concurrency tests hold an
+   * import transaction open while cuts/closes race it.
+   */
+  async bulkImportOn(client: Queryer, input: BulkImportInput): Promise<ImportResultItem[]> {
     if (!Array.isArray(input.records)) {
       throw new ValidationException([{ field: 'records', code: 'MISSING_FIELD', message: 'records array required' }]);
     }
@@ -252,139 +288,146 @@ export class ActivityDataService {
       else firstIndex.set(r.recordNo, i);
     });
 
-    await this.db.withTransaction(async (client) => {
-      // Factor context for optional cross-validation. Density/NCV are
-      // versioned per fuel; resolved per record from this map.
-      let factorRows: FactorRow[] | undefined;
-      let fuelProps: Map<string, { density: Fraction | null; ncv: Fraction | null }> | undefined;
-      if (input.validateAgainstFactorVersion !== undefined) {
-        const v = await this.factors.getVersion(input.validateAgainstFactorVersion);
-        factorRows = await this.factors.getFactors(client, v.id);
-        fuelProps = await this.factors.getFuelProperties(client, v.id);
-      }
+    // Factor context for optional cross-validation. Density/NCV are
+    // versioned per fuel; resolved per record from this map.
+    let factorRows: FactorRow[] | undefined;
+    let fuelProps: Map<string, { density: Fraction | null; ncv: Fraction | null }> | undefined;
+    if (input.validateAgainstFactorVersion !== undefined) {
+      const v = await this.factors.getVersion(input.validateAgainstFactorVersion);
+      factorRows = await this.factors.getFactors(client, v.id);
+      fuelProps = await this.factors.getFuelProperties(client, v.id);
+    }
 
-      // Existing record numbers in this batch.
-      const nos = input.records.map((r) => r.recordNo).filter(Boolean);
-      const existing = new Map<string, StoredRecord>();
-      if (nos.length) {
-        const res = await client.query<StoredRecord>(
-          `SELECT record_no, site_code, source_code, month, fuel_key, scope,
-                  quantity_num, quantity_den, unit, is_correction,
-                  supersedes_record_no, created_at
-           FROM activity_records WHERE record_no = ANY($1)`,
-          [nos]
-        );
-        for (const row of res.rows) existing.set(row.record_no, row);
-      }
+    // Existing record numbers in this batch.
+    const nos = input.records.map((r) => r.recordNo).filter(Boolean);
+    const existing = new Map<string, StoredRecord>();
+    if (nos.length) {
+      const res = await client.query<StoredRecord>(
+        `SELECT record_no, site_code, source_code, month, fuel_key, scope,
+                quantity_num, quantity_den, unit, is_correction,
+                supersedes_record_no, created_at, import_batch_id
+         FROM activity_records WHERE record_no = ANY($1)`,
+        [nos]
+      );
+      for (const row of res.rows) existing.set(row.record_no, row);
+    }
 
-      const correctionTargets = input.records
-        .map((r) => r.supersedesRecordNo)
-        .filter((x): x is string => !!x);
-      const targetRows = correctionTargets.length
-        ? await client.query<{ record_no: string }>(
-            `SELECT record_no FROM activity_records WHERE record_no = ANY($1)`,
-            [correctionTargets]
-          )
-        : null;
-      const targetExists = new Set((targetRows?.rows ?? []).map((r) => r.record_no));
-      const alreadyCorrected = new Set<string>();
-      if (correctionTargets.length) {
-        const used = await client.query<{ supersedes_record_no: string }>(
-          `SELECT supersedes_record_no FROM activity_records
-           WHERE supersedes_record_no = ANY($1)`,
+    const correctionTargets = input.records
+      .map((r) => r.supersedesRecordNo)
+      .filter((x): x is string => !!x);
+    const targetRows = correctionTargets.length
+      ? await client.query<{ record_no: string }>(
+          `SELECT record_no FROM activity_records WHERE record_no = ANY($1)`,
           [correctionTargets]
-        );
-        used.rows.forEach((r) => alreadyCorrected.add(r.supersedes_record_no));
-      }
-      // Targets claimed earlier inside the same batch are also occupied.
-      const claimedInBatch = new Set<string>();
+        )
+      : null;
+    const targetExists = new Set((targetRows?.rows ?? []).map((r) => r.record_no));
+    const alreadyCorrected = new Set<string>();
+    if (correctionTargets.length) {
+      const used = await client.query<{ supersedes_record_no: string }>(
+        `SELECT supersedes_record_no FROM activity_records
+         WHERE supersedes_record_no = ANY($1)`,
+        [correctionTargets]
+      );
+      used.rows.forEach((r) => alreadyCorrected.add(r.supersedes_record_no));
+    }
+    // Targets claimed earlier inside the same batch are also occupied.
+    const claimedInBatch = new Set<string>();
 
-      const accepted: Array<{ rec: ActivityInput; qty: Fraction }> = [];
+    const accepted: Array<{ rec: ActivityInput; qty: Fraction }> = [];
 
-      for (let i = 0; i < input.records.length; i++) {
-        const rec = input.records[i];
+    for (let i = 0; i < input.records.length; i++) {
+      const rec = input.records[i];
 
-        if (batchDuplicate.has(i)) {
-          results[i] = {
-            recordNo: rec.recordNo,
-            status: 'duplicate',
-            errors: [
-              {
-                field: `records[${i}].recordNo`,
-                code: 'DUPLICATE_KEY',
-                message: `recordNo ${rec.recordNo} already appeared earlier in this batch; ignored`,
-                recordId: rec.recordNo
-              }
-            ]
-          };
-          continue;
-        }
-
-        const prior = rec.recordNo ? existing.get(rec.recordNo) : undefined;
-        if (prior) {
-          // Idempotent re-submission: identical payload => no-op success.
-          const same =
-            prior.site_code === rec.siteCode &&
-            prior.source_code === rec.sourceCode &&
-            prior.fuel_key === rec.fuelKey &&
-            prior.scope === rec.scope &&
-            prior.unit === rec.unit &&
-            monthToString(prior.month) === rec.month &&
-            prior.supersedes_record_no === (rec.supersedesRecordNo ?? null) &&
-            Fraction.of(BigInt(prior.quantity_num), BigInt(prior.quantity_den)).compare(
-              Fraction.from(rec.quantity)
-            ) === 0;
-          results[i] = same
-            ? { recordNo: rec.recordNo, status: 'duplicate' }
-            : {
-                recordNo: rec.recordNo,
-                status: 'rejected',
-                errors: [
-                  {
-                    field: `records[${i}].recordNo`,
-                    code: 'DUPLICATE_KEY',
-                    message: `recordNo ${rec.recordNo} already exists with different content`,
-                    recordId: rec.recordNo
-                  }
-                ]
-              };
-          continue;
-        }
-
-        const supersedes = rec.supersedesRecordNo;
-        const correctionTarget = supersedes
-          ? {
-              exists: targetExists.has(supersedes),
-              free:
-                targetExists.has(supersedes) &&
-                !alreadyCorrected.has(supersedes) &&
-                !claimedInBatch.has(supersedes)
+      if (batchDuplicate.has(i)) {
+        results[i] = {
+          recordNo: rec.recordNo,
+          status: 'duplicate',
+          errors: [
+            {
+              field: `records[${i}].recordNo`,
+              code: 'DUPLICATE_KEY',
+              message: `recordNo ${rec.recordNo} already appeared earlier in this batch; ignored`,
+              recordId: rec.recordNo
             }
-          : undefined;
-
-        const v = await this.validateRecord(rec, i, {
-          factorRows,
-          factorDensity: (() => {
-            const p = rec.fuelKey ? fuelProps?.get(rec.fuelKey) : undefined;
-            return p ? { density: p.density ?? undefined, ncvMass: p.ncv ?? undefined } : undefined;
-          })(),
-          correctionTarget
-        });
-        if (!v.valid || !v.quantity) {
-          results[i] = { recordNo: rec.recordNo, status: 'rejected', errors: v.errors };
-          continue;
-        }
-        if (supersedes) claimedInBatch.add(supersedes);
-        accepted.push({ rec, qty: v.quantity });
-        results[i] = { recordNo: rec.recordNo, status: 'accepted' };
+          ]
+        };
+        continue;
       }
 
+      const prior = rec.recordNo ? existing.get(rec.recordNo) : undefined;
+      if (prior) {
+        // Idempotent re-submission: identical payload => no-op success.
+        const same =
+          prior.site_code === rec.siteCode &&
+          prior.source_code === rec.sourceCode &&
+          prior.fuel_key === rec.fuelKey &&
+          prior.scope === rec.scope &&
+          prior.unit === rec.unit &&
+          monthToString(prior.month) === rec.month &&
+          prior.supersedes_record_no === (rec.supersedesRecordNo ?? null) &&
+          Fraction.of(BigInt(prior.quantity_num), BigInt(prior.quantity_den)).compare(
+            Fraction.from(rec.quantity)
+          ) === 0;
+        results[i] = same
+          ? { recordNo: rec.recordNo, status: 'duplicate' }
+          : {
+              recordNo: rec.recordNo,
+              status: 'rejected',
+              errors: [
+                {
+                  field: `records[${i}].recordNo`,
+                  code: 'DUPLICATE_KEY',
+                  message: `recordNo ${rec.recordNo} already exists with different content`,
+                  recordId: rec.recordNo
+                }
+              ]
+            };
+        continue;
+      }
+
+      const supersedes = rec.supersedesRecordNo;
+      const correctionTarget = supersedes
+        ? {
+            exists: targetExists.has(supersedes),
+            free:
+              targetExists.has(supersedes) &&
+              !alreadyCorrected.has(supersedes) &&
+              !claimedInBatch.has(supersedes)
+          }
+        : undefined;
+
+      const v = await this.validateRecord(rec, i, {
+        factorRows,
+        factorDensity: (() => {
+          const p = rec.fuelKey ? fuelProps?.get(rec.fuelKey) : undefined;
+          return p ? { density: p.density ?? undefined, ncvMass: p.ncv ?? undefined } : undefined;
+        })(),
+        correctionTarget
+      });
+      if (!v.valid || !v.quantity) {
+        results[i] = { recordNo: rec.recordNo, status: 'rejected', errors: v.errors };
+        continue;
+      }
+      if (supersedes) claimedInBatch.add(supersedes);
+      accepted.push({ rec, qty: v.quantity });
+      results[i] = { recordNo: rec.recordNo, status: 'accepted' };
+    }
+
+    if (accepted.length) {
+      // One commit-serial batch for the whole import transaction. The batch
+      // row only becomes visible when this transaction commits.
+      const batch = await client.query<{ id: string }>(
+        `INSERT INTO activity_import_batches DEFAULT VALUES RETURNING id`
+      );
+      const batchId = batch.rows[0].id;
       for (const { rec, qty } of accepted) {
         await client.query(
           `INSERT INTO activity_records
              (record_no, site_code, source_code, month, fuel_key, scope,
-              quantity_num, quantity_den, unit, is_correction, supersedes_record_no)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              quantity_num, quantity_den, unit, is_correction,
+              supersedes_record_no, import_batch_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
           [
             rec.recordNo,
             rec.siteCode,
@@ -396,11 +439,12 @@ export class ActivityDataService {
             qty.den,
             rec.unit,
             rec.supersedesRecordNo ? true : false,
-            rec.supersedesRecordNo ?? null
+            rec.supersedesRecordNo ?? null,
+            batchId
           ]
         );
       }
-    });
+    }
 
     return results;
   }
@@ -452,7 +496,7 @@ export class ActivityDataService {
     const res = await this.db.query<StoredRecord>(
       `SELECT record_no, site_code, source_code, month, fuel_key, scope,
               quantity_num, quantity_den, unit, is_correction,
-              supersedes_record_no, created_at
+              supersedes_record_no, created_at, import_batch_id
        FROM activity_records WHERE record_no = $1`,
       [recordNo]
     );
@@ -463,78 +507,142 @@ export class ActivityDataService {
   // Cut-off points
   // --------------------------------------------------------------------------
 
-  async createCut(asOfIso: string, label?: string): Promise<{ id: number; asOf: Date }> {
+  /**
+   * Manual cut at an explicitly given (usually past) timestamp. Semantics are
+   * unchanged: records with created_at <= asOf, minus chains whose head moved
+   * by the same boundary. This is a statement about wall-clock history, not
+   * about the current committed state.
+   */
+  async createCut(asOfIso: string, label?: string): Promise<{ id: number; asOf: Date; mode: CutMode }> {
     const asOf = new Date(asOfIso);
     if (Number.isNaN(asOf.getTime())) {
       throw new ValidationException([{ field: 'asOf', code: 'INVALID_VALUE', message: 'bad ISO timestamp' }]);
     }
     try {
       const res = await this.db.query<{ id: number; as_of: Date }>(
-        'INSERT INTO activity_cuts(label, as_of) VALUES ($1, $2) RETURNING id, as_of',
+        `INSERT INTO activity_cuts(label, as_of, cut_mode)
+         VALUES ($1, $2, 'timestamp') RETURNING id, as_of`,
         [label ?? null, asOf]
       );
-      return { id: res.rows[0].id, asOf: res.rows[0].as_of };
+      return { id: res.rows[0].id, asOf: res.rows[0].as_of, mode: 'timestamp' };
     } catch (e) {
       if ((e as { code?: string }).code === '23505') {
         const res = await this.db.query<{ id: number; as_of: Date }>(
-          'SELECT id, as_of FROM activity_cuts WHERE as_of = $1',
+          `SELECT id, as_of FROM activity_cuts
+           WHERE as_of = $1 AND cut_mode = 'timestamp'`,
           [asOf]
         );
-        return { id: res.rows[0].id, asOf: res.rows[0].as_of };
+        return { id: res.rows[0].id, asOf: res.rows[0].as_of, mode: 'timestamp' };
       }
       throw e;
     }
   }
 
-  /** Convenience: a cut meaning "everything committed up to now". */
-  async createCutNow(label?: string): Promise<{ id: number; asOf: Date }> {
-    return this.db.withTransaction(async (client) => {
-      const res = await client.query<{ id: number; as_of: Date }>(
-        `INSERT INTO activity_cuts(label, as_of)
-         VALUES ($1, clock_timestamp())
-         RETURNING id, as_of`,
-        [label ?? null]
-      );
-      return { id: res.rows[0].id, asOf: res.rows[0].as_of };
-    });
+  /**
+   * A cut meaning "everything committed so far". The boundary is defined by
+   * commit serial, not by wall clock: the cut transaction's snapshot sees
+   * exactly the batches that committed before it, and that set is frozen into
+   * `cut_batches`. An import that is still open (or commits afterwards) is
+   * absent from the frozen set now and forever, so re-querying the cut can
+   * never gain or lose rows.
+   */
+  async createCutNow(label?: string): Promise<{ id: number; mode: 'committed' }> {
+    return this.db.withSnapshotTransaction((client) => this.createCutNowOn(client, label));
   }
 
-  async getCut(id: number): Promise<{ id: number; asOf: Date; label: string | null }> {
+  /**
+   * Freeze the commit-set cut inside an already-open transaction. Used by
+   * createCutNow() and by the monthly close, which must freeze its boundary
+   * with the *same* snapshot it uses to write the snapshot rows — otherwise
+   * the disclosed snapshot and a later recomputation against the locked cut
+   * could diverge.
+   */
+  async createCutNowOn(client: Queryer, label?: string): Promise<{ id: number; mode: 'committed' }> {
+    const cut = await client.query<{ id: number }>(
+      `INSERT INTO activity_cuts(label, as_of, cut_mode)
+       VALUES ($1, NULL, 'committed') RETURNING id`,
+      [label ?? null]
+    );
+    const cutId = cut.rows[0].id;
+    // Freeze every batch visible to this transaction's snapshot. In READ
+    // COMMITTED each statement gets a fresh snapshot, so createCutNow runs
+    // under REPEATABLE READ; the close already does. The NOT EXISTS guard
+    // excludes batch rows left behind by rolled-back transactions (a sequence
+    // value can be consumed by a transaction that never committed and
+    // therefore has no records).
+    await client.query(
+      `INSERT INTO cut_batches(cut_id, batch_id)
+       SELECT $1, b.id
+       FROM activity_import_batches b
+       WHERE EXISTS (SELECT 1 FROM activity_records r WHERE r.import_batch_id = b.id)`,
+      [cutId]
+    );
+    return { id: cutId, mode: 'committed' };
+  }
+
+  async getCut(id: number): Promise<CutInfo> {
     return this.getCutOn(this.db, id);
   }
 
-  async getCutOn(
-    client: Queryer,
-    id: number
-  ): Promise<{ id: number; asOf: Date; label: string | null }> {
-    const res = await client.query<{ id: number; as_of: Date; label: string | null }>(
-      'SELECT id, as_of, label FROM activity_cuts WHERE id = $1',
+  async getCutOn(client: Queryer, id: number): Promise<CutInfo> {
+    const res = await client.query<{ id: number; as_of: Date | null; label: string | null; cut_mode: CutMode }>(
+      'SELECT id, as_of, label, cut_mode FROM activity_cuts WHERE id = $1',
       [id]
     );
     if (!res.rows[0]) throw new NotFoundError(`activity cut not found: ${id}`);
-    return { id: res.rows[0].id, asOf: res.rows[0].as_of, label: res.rows[0].label };
+    return {
+      id: res.rows[0].id,
+      asOf: res.rows[0].as_of,
+      label: res.rows[0].label,
+      mode: res.rows[0].cut_mode
+    };
   }
 
   /**
    * The effective record set at a cut: for every correction chain, the head
-   * whose created_at <= as_of (NOT EXISTS a successor visible by the cut).
-   * Records created after the cut are invisible even if they correct a visible
-   * record — this is exactly what "活动数据截止点" means.
+   * visible by the cut.
+   *
+   * - timestamp cuts: created_at <= as_of on both the record and its possible
+   *   successor (the original wall-clock semantics, kept for manual cuts);
+   * - committed cuts: the record's import batch is in the frozen batch set,
+   *   and the same membership test applies to any successor. The frozen set
+   *   never changes, so this set is identical on every re-query regardless of
+   *   imports or corrections committing later.
    */
-  async getEffectiveRecords(client: Queryer, asOf: Date): Promise<ActivityRecord[]> {
+  async getEffectiveRecords(client: Queryer, cut: CutInfo): Promise<ActivityRecord[]> {
+    if (cut.mode === 'timestamp') {
+      const res = await client.query<StoredRecord>(
+        `SELECT r.record_no, r.site_code, r.source_code, r.month, r.fuel_key,
+                r.scope, r.quantity_num, r.quantity_den, r.unit, r.is_correction,
+                r.supersedes_record_no, r.created_at, r.import_batch_id
+         FROM activity_records r
+         WHERE r.created_at <= $1
+           AND NOT EXISTS (
+               SELECT 1 FROM activity_records s
+               WHERE s.supersedes_record_no = r.record_no
+                 AND s.created_at <= $1
+           )
+         ORDER BY r.record_no`,
+        [cut.asOf]
+      );
+      return res.rows.map(hydrate);
+    }
+
     const res = await client.query<StoredRecord>(
       `SELECT r.record_no, r.site_code, r.source_code, r.month, r.fuel_key,
               r.scope, r.quantity_num, r.quantity_den, r.unit, r.is_correction,
-              r.supersedes_record_no, r.created_at
+              r.supersedes_record_no, r.created_at, r.import_batch_id
        FROM activity_records r
-       WHERE r.created_at <= $1
+       WHERE EXISTS (
+               SELECT 1 FROM cut_batches cb WHERE cb.cut_id = $1 AND cb.batch_id = r.import_batch_id
+             )
          AND NOT EXISTS (
-             SELECT 1 FROM activity_records s
-             WHERE s.supersedes_record_no = r.record_no
-               AND s.created_at <= $1
-         )
+               SELECT 1 FROM activity_records s
+               JOIN cut_batches cb ON cb.batch_id = s.import_batch_id AND cb.cut_id = $1
+               WHERE s.supersedes_record_no = r.record_no
+             )
        ORDER BY r.record_no`,
-      [asOf]
+      [cut.id]
     );
     return res.rows.map(hydrate);
   }

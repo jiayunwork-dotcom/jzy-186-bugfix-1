@@ -43,7 +43,8 @@ export interface LineageContribution {
 export interface LineageReport {
   caliber: {
     cutId: number;
-    cutAsOf: Date;
+    cutMode: 'timestamp' | 'committed';
+    cutAsOf: Date | null;
     factorVersionId: number;
     factorVersion: string;
     gwpSetId: number;
@@ -114,7 +115,8 @@ export class LineageService {
     return {
       caliber: {
         cutId: bundle.caliber.cutId,
-        cutAsOf: bundle.asOf,
+        cutMode: bundle.cut.mode,
+        cutAsOf: bundle.cut.asOf,
         factorVersionId: bundle.caliber.factorVersionId,
         factorVersion: bundle.factorVersion,
         gwpSetId: bundle.caliber.gwpSetId,

@@ -123,7 +123,8 @@ describe('activity data validation, corrections and idempotency', () => {
     expect(reason).toBeInstanceOf(ConflictError);
     // only one correction row points at R1
     const cut = await h.activity.createCutNow('c');
-    const eff = await h.activity.getEffectiveRecords(h.db, cut.asOf);
+    const cutInfo = await h.activity.getCut(cut.id);
+    const eff = await h.activity.getEffectiveRecords(h.db, cutInfo);
     const chains = eff.filter((r) => r.siteCode === 'S1' && r.sourceCode === 'BOILER');
     expect(chains).toHaveLength(1);
     expect(['101', '102']).toContain(chains[0].quantityFraction.toDecimalString());
@@ -175,8 +176,10 @@ describe('activity data validation, corrections and idempotency', () => {
       records: [{ ...baseRec, recordNo: 'R1B', quantity: '140', supersedesRecordNo: 'R1' }]
     });
     const cut1 = await h.activity.createCutNow('cut1');
-    const at0 = await h.activity.getEffectiveRecords(h.db, cut0.asOf);
-    const at1 = await h.activity.getEffectiveRecords(h.db, cut1.asOf);
+    const cut0Info = await h.activity.getCut(cut0.id);
+    const cut1Info = await h.activity.getCut(cut1.id);
+    const at0 = await h.activity.getEffectiveRecords(h.db, cut0Info);
+    const at1 = await h.activity.getEffectiveRecords(h.db, cut1Info);
     expect(at0.find((r) => r.recordNo === 'R1')?.quantityFraction.toDecimalString()).toBe('100');
     expect(at1.find((r) => r.recordNo === 'R1B')?.quantityFraction.toDecimalString()).toBe('140');
     expect(at1.find((r) => r.recordNo === 'R1')).toBeUndefined();

@@ -29,7 +29,8 @@ export class SummaryController {
     return {
       caliber: {
         ...body.caliber,
-        cutAsOf: bundle.asOf,
+        cutMode: bundle.cut.mode,
+        cutAsOf: bundle.cut.asOf,
         factorVersion: bundle.factorVersion,
         gwpSetCode: bundle.gwpSetCode
       },

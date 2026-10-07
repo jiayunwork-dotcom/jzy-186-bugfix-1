@@ -5,6 +5,7 @@ import {
   AccountingModule,
   AccountingService
 } from '../accounting/accounting.service';
+import { ActivityDataModule, ActivityDataService } from '../activity-data/activity-data.service';
 import { GwpModule, GwpService } from '../factor-library/gwp.service';
 import { GASES, type Gas } from '../factor-library/factor-library.service';
 import { flattenLeaves } from '../accounting/engine';
@@ -21,8 +22,8 @@ export interface CloseMonthInput {
   /** Close a single site; omit for the company-wide disclosure close. */
   siteCode?: string;
   /**
-   * Activity cut to lock. If omitted, the close captures its own cut at the
-   * instant it starts (clock_timestamp inside the repeatable-read txn).
+   * Activity cut to lock. If omitted, the close freezes its own commit-set cut
+   * from the snapshot at the instant it starts (inside the close transaction).
    */
   cutId?: number;
 }
@@ -39,6 +40,7 @@ export class CloseService {
   constructor(
     private readonly db: DbService,
     private readonly accounting: AccountingService,
+    private readonly activity: ActivityDataService,
     private readonly gwp: GwpService
   ) {}
 
@@ -50,10 +52,13 @@ export class CloseService {
    *  1. The transaction runs on a REPEATABLE READ snapshot taken at its first
    *     read, so master data / factor rows it reads are frozen.
    *  2. The three caliber references are *immutable objects*: a factor
-   *     version id always points at the same rows and the activity cut is a
-   *     fixed timestamp. A concurrent publish creates a *new* version id and
-   *     cannot alter the one the close holds; a correction committed after
-   *     the cut timestamp is excluded by the effective-record query.
+   *     version id always points at the same rows, and the activity cut
+   *     freezes the set of import batches visible to this snapshot (a
+   *     commit-serial boundary, not a wall-clock timestamp). A concurrent
+   *     publish creates a *new* version id and cannot alter the one the close
+   *     holds; an import committing after the snapshot is absent from the
+   *     frozen batch set both now and in every future recomputation — snapshot
+   *     and recompute can never diverge.
    *  3. A per-grain advisory lock makes concurrent closes of the same month
    *     deterministic: the second sees the first's committed row and fails
    *     with ALREADY_CLOSED.
@@ -85,22 +90,24 @@ export class CloseService {
         throw new ConflictError('month', `${input.month} is already closed (close id ${dup.rows[0].id})`);
       }
 
-      // Resolve / create the cut inside the transaction snapshot. The cut
-      // timestamp is transaction_timestamp(): it equals the instant of the
-      // first statement in this repeatable-read transaction, so (a) the
-      // effective-record SQL cannot see rows committed afterwards, and (b) a
-      // future on-demand recomputation against this very cut id applies the
-      // same created_at <= as_of bound and reaches the same set. Using
-      // clock_timestamp() here would let a correction committed mid-close be
-      // snapshot-invisible now but visible in a later recomputation.
+      // Freeze the activity boundary with the *same* repeatable-read snapshot
+      // used to compute the snapshot rows below. The cut captures exactly the
+      // import batches committed before this transaction's snapshot, so:
+      //   (a) rows of an import still open at close time are absent from the
+      //       disclosed snapshot, and
+      //   (b) when that import commits afterwards, recomputing against this
+      //       very cut id applies the frozen batch set — not a timestamp
+      //       predicate — and reaches the exact same record set.
+      // A clock/now() timestamp could not give (b): such an import's rows
+      // carry a created_at frozen at its transaction start (before the close)
+      // and would become "visible" on a later READ COMMITTED recomputation.
       let cutId = input.cutId;
       if (!cutId) {
-        const r = await client.query<{ id: number }>(
-          `INSERT INTO activity_cuts(label, as_of)
-           VALUES ($1, now()) RETURNING id, as_of`,
-          [`close ${input.month}${input.siteCode ? ` ${input.siteCode}` : ''}`]
+        const cut = await this.activity.createCutNowOn(
+          client,
+          `close ${input.month}${input.siteCode ? ` ${input.siteCode}` : ''}`
         );
-        cutId = r.rows[0].id;
+        cutId = cut.id;
       }
 
       // Validate the other caliber objects under the same snapshot.
@@ -287,7 +294,7 @@ function hashLockKey(s: string): bigint {
 }
 
 @Module({
-  imports: [DbModule, AccountingModule, GwpModule],
+  imports: [DbModule, AccountingModule, ActivityDataModule, GwpModule],
   providers: [CloseService],
   exports: [CloseService]
 })

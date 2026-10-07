@@ -1,7 +1,7 @@
 import { Injectable, Module } from '@nestjs/common';
 import { PoolClient } from 'pg';
 import { DbModule, DbService, type Queryer } from '../database/database.module';
-import { ActivityDataModule, ActivityDataService, type ActivityRecord } from '../activity-data/activity-data.service';
+import { ActivityDataModule, ActivityDataService, type ActivityRecord, type CutInfo } from '../activity-data/activity-data.service';
 import {
   FactorLibraryModule,
   FactorLibraryService
@@ -26,7 +26,7 @@ import { NotFoundError } from '../common/errors';
  */
 export interface CaliberBundle {
   caliber: Caliber;
-  asOf: Date;
+  cut: CutInfo;
   factorVersion: string;
   gwpSetCode: string;
   records: ActivityRecord[];
@@ -54,16 +54,17 @@ export class AccountingService {
     if (!gwpSet.rows[0]) {
       throw new NotFoundError(`GWP set not found: ${caliber.gwpSetId}`);
     }
-    const [records, rows, props, gwpValues] = await Promise.all([
-      this.activity.getEffectiveRecords(client, cut.asOf),
-      this.factors.getFactors(client, caliber.factorVersionId),
-      this.factors.getFuelProperties(client, caliber.factorVersionId),
-      this.gwp.getValues(client, caliber.gwpSetId)
-    ]);
+    // Serialised rather than Promise.all: inside the close transaction these
+    // run on one PoolClient, and pg does not allow concurrent queries on a
+    // single client. On the pool these are independent round-trips anyway.
+    const records = await this.activity.getEffectiveRecords(client, cut);
+    const rows = await this.factors.getFactors(client, caliber.factorVersionId);
+    const props = await this.factors.getFuelProperties(client, caliber.factorVersionId);
+    const gwpValues = await this.gwp.getValues(client, caliber.gwpSetId);
     const index: FactorIndex = { rows, props, gwp: gwpValues };
     return {
       caliber,
-      asOf: cut.asOf,
+      cut,
       factorVersion: version.version,
       gwpSetCode: gwpSet.rows[0].code,
       records,

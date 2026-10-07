@@ -26,12 +26,12 @@ src/
   close/           月度关账与披露快照（含快照级追溯行）
   lineage/         任意口径汇总数字的来源记录与因子解释
   interfaces/      NestJS 控制器（HTTP 接口）
-test/              6 个测试文件、33 个用例
+test/              7 个测试文件、38 个用例（含 4 个并发回归）
 ```
 
 ---
 
-## 2. 三个核心设计决定（审计最关心的部分）
+## 2. 核心设计决定（审计最关心的部分）
 
 ### 2.1 精确有理数：所有数字用 `bigint` 分子/分母，不用浮点
 
@@ -57,8 +57,11 @@ test/              6 个测试文件、33 个用例
 
 - **因子版本/GWP 集合**：只追加，一经发布不可改。新版本永远是新的 `id`，
   不可能影响任何旧口径。
-- **活动数据截止点（cut）**：一个不可变时间戳 `as_of`。某时刻的有效记录集
-  完全由它推导（见 2.4），所以不需要为每次查询复制活动数据。
+- **活动数据截止点（cut）**：分两种，含义都不可变（见 2.4、2.7）：
+  - “此刻”截止点（`POST /activity-records/cuts` 不带 `asOf`，以及月度关账
+    自建的截止点）冻结创建那一刻**已提交的导入批次集合**，按提交序列号界定，
+    与墙上时钟无关；
+  - 手工给定过去时间点的截止点保持原有的 `created_at <= as_of` 时间戳语义。
 
 口径一旦确定，任何时候、用任何方式查询，结果都相同。
 
@@ -103,15 +106,22 @@ phi_G = 1/6 ( 2f001 + f101 + f011 + 2f111 − 2f000 − f100 − f010 − 2f110 
     **两条更正并发提交时，数据库只接受一条，另一条得到唯一键冲突（409）**。
 - 同一 `record_no` 重复提交：内容相同记为 `duplicate` 不重复计数；
   内容不同直接拒绝。
+- 每次导入事务是一个**导入批次（import batch）**：`activity_import_batches`
+  一行，`id` 来自单调序列，记录带 `import_batch_id`。批次行与记录在同一事务
+  里写入，因此“批次行对外可见”与“本次导入已提交”严格等价，序列值天然是
+  提交序列号（回滚事务造成的空洞没有任何记录，永不参与可见性）。
 - 截止点 `c` 处的有效记录集（`getEffectiveRecords`）：
+  - **“此刻”截止点（committed 型）**：记录所属批次在该截止点冻结的
+    `cut_batches` 集合中，且不存在“其更正记录的批次也在该集合中”的后继。
+    冻结集合是显式物化的，导入/更正在截止点之后提交不会改变集合。
+  - **手工时间戳截止点（timestamp 型，显式传 `asOf`）**：沿用原语义
 
-  ```sql
-  r.created_at <= c.as_of
-  AND NOT EXISTS (更正 s：s.supersedes_record_no = r.record_no AND s.created_at <= c.as_of)
-  ```
+    ```sql
+    r.created_at <= c.as_of
+    AND NOT EXISTS (更正 s：s.supersedes_record_no = r.record_no AND s.created_at <= c.as_of)
+    ```
 
-  即“每条更正链在该时点可见的链头”。截止点之后提交的更正即使更正的是
-  旧记录，也不可见。
+  两种截止点都是“每条更正链在该口径可见的链头”。
 
 ### 2.5 基准年重算规则
 
@@ -140,15 +150,71 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 那一刻的数据”）：
 
 1. 关账在 **REPEATABLE READ** 事务中进行；
-2. 事务内取**事务开始时间** `now()`（即 `transaction_timestamp()`）创建 cut，
-   因此有效记录查询的 `created_at <= as_of` 边界与事务快照是同一时刻——
-   关账期间提交的更正既进不了快照，也进不了未来按该 cut 的重算，二者一致；
+2. 事务内**用同一个快照**冻结一个 committed 型截止点（`createCutNowOn`）：
+   `cut_batches` 冻结的正是关账快照可见的全部导入批次。因此关账期间提交的
+   导入/更正既进不了快照，也进不了未来按该 cut 的重算——快照与重算用的是
+   同一份冻结集合，二者一致（旧实现用 `now()/clock_timestamp()` 时间戳只能
+   保证事务内看不到，事后按时间戳重算会把“事务开始早、提交晚”的行重新算
+   进来，详见 2.7）；
 3. 因子/GWP 用固定的不可变 `id` 引用，期间发布的新版本是另一个 `id`，
    不可能被本次关账读到；
 4. 同粒度（公司级/厂区级 × 月份）用事务级咨询锁串行化，重复关账返回
    `ALREADY_CLOSED`。
 
 快照写完后再发布因子、提交更正、补录晚到数据，都不会改变快照（有测试）。
+
+### 2.7 “哪些记录算在‘此刻’截止点里面”——按提交序列号冻结，不按墙上时钟
+
+**问题（年中核对时的真实现象）**。活动记录的 `created_at` 默认取
+`transaction_timestamp()`，在**事务开始**那一刻就冻结了；而其他事务要到该
+事务 **COMMIT** 才能看到这些行。几百条一次、多批并行的导入要跑一两秒，于是
+出现这种交错：
+
+```
+导入事务 T_imp BEGIN（created_at 锁定为 t0）
+                    “此刻”截止点：as_of = t1，t0 < t1，立刻查询
+                    → 看不到未提交的行，总量 X
+T_imp COMMIT       （此时行才对外可见）
+                    同一截止点再查：created_at = t0 <= t1，行“符合时间戳”
+                    → 总量变成 X + 这批行
+```
+
+时间戳没变、记录也不是截止点之后登记的，数字却前后不一。关账更严重：
+REPEATABLE READ 快照着关账事务的快照写快照（2212 t），而事后用
+READ COMMITTED 新快照按同一时间戳重算，会把那些“开始得早、提交得晚”的行
+算进来（35 392 t），快照与对比/追溯接口对不上。
+
+**候选方案与取舍**（在导入吞吐、关账等待、对已存在截止点的兼容三者之间）：
+
+| 方案 | 正确性 | 导入吞吐 | 关账等待 | 对已有截止点/旧数据 |
+|---|---|---|---|---|
+| A. 时间戳 + 导入全局串行锁 | 正确 | **差**：所有批次序列化，几百条×多批退化成单队列 | 关账也要抢锁，等待全部在途导入 | 无表结构改动 |
+| B. 全量快照记录集（每个 cut 物化全部行） | 正确 | 好 | 关账要拷贝当月/全量行，随数据量线性变慢 | 存储随 cut 数×行数膨胀；追溯要改读快照表 |
+| C. 改用真实提交时间戳（提交时回写 `committed_at`） | 正确（单调） | 好 | 快（只取 `max(committed_at)` 式谓词） | 历史 cut 无法解释：升级前在途事务的提交时间无法重建，老 cut 含义会漂移；且谓词仍是“对可变列做比较” |
+| D. **提交序列号 + 冻结批次集合（采用）** | 正确 | **不变**：批次只是导入事务内多插一行序列，批次间完全并发 | **快且恒定**：一次集合插入，与记录总量无关 | 迁移 0002 幂等；旧行归入基线批次 1；旧手工时间戳 cut 语义原样保留 |
+
+**选用 D**：
+
+- 每次导入事务在 `activity_import_batches` 插一行（同事务），记录带
+  `import_batch_id`；序列值即提交序列号。
+- “此刻”截止点 / 关账在自己的 REPEATABLE READ 事务里，把**当前快照可见的
+  全部批次**物化进 `cut_batches(cut_id, batch_id)`。成员资格是显式集合，
+  之后提交的批次拿到更大的新 id，却不在这个集合里——任何时候重查都逐位
+  相同。关账写快照与日后重算共用同一份冻结集合，天然一致。
+
+**付出的代价与边界**：
+
+1. *存储*：每个 committed 型 cut 一行批次集合成员（`cut_batches`）。批量灌
+   数时如果每个请求都建 cut，行数随“cut 数 × 累计批次数”增长；有
+   `(cut_id, batch_id)` 主键与反向索引，查询仍是主键连接。需要时可用
+   “高水位批次号 + 显式排除集合”压缩（当前未做，YAGNI）。
+2. *写者纪律*：任何写入 `activity_records` 的新代码路径都必须在同一事务里
+   分配批次号（列已设 `NOT NULL` + 外键，漏了会直接报错，不会静默出错）。
+3. *手工时间戳 cut 不再承诺“对并发提交稳定”*：它表达的是“按墙上时钟回放
+   历史”，语义与以前完全一致；需要“此刻且永不漂移”的调用方一律用不带
+   `asOf` 的 committed 型截止点。
+4. *迁移*：0002 给历史记录统一归入不可变基线批次 1，使升级前已存在的
+   “此刻”cut/关账仍包含升级时刻的全部数据；新导入从批次 2 起编号。
 
 ---
 
@@ -198,8 +264,8 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 | `POST /activity-records/import` | 批量导入（逐条回报；可带 `validateAgainstFactorVersion`） |
 | `POST /activity-records/correct` | 更正一条（并发落败返回 409） |
 | `GET /activity-records/:recordNo` | 查单条记录 |
-| `POST /activity-records/cuts` | 创建截止点（不传 `asOf` 即“当前已提交的全部”） |
-| `GET /activity-records/cuts/:id` | 查截止点 |
+| `POST /activity-records/cuts` | 创建截止点（不传 `asOf` 即冻结“当前已提交的全部”批次集合，永不漂移；传 `asOf` 为手工时间戳 cut，语义不变）；响应含 `mode: committed|timestamp` |
+| `GET /activity-records/cuts/:id` | 查截止点（`mode`、committed 型 `asOf` 为 `null`、timestamp 型返回边界时间） |
 | `POST /accounting/summary` | 按口径汇总；`groupBy` 任取 `site/source/month`，带 filter |
 | `POST /restatements/compare` | 两口径对比 + Shapley 分解；可带 `baseYear`/阈值 |
 | `GET /restatements/base-year-flags/:year` | 基准年标记 |
@@ -231,7 +297,7 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 
 ---
 
-## 6. 测试（Jest，33 个用例，6 个文件）
+## 6. 测试（Jest，38 个用例，7 个文件）
 
 - `fraction.spec.ts`：5.61 t 算例、精确解析、严格相等；
 - `units.spec.ts`：SI 换算精确、密度+热值跨量纲**往返不变**、缺物性时报错；
@@ -244,7 +310,12 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
   快照与按关账口径全量重算一致；快照血缘；重复关账被拒；
 - `activity-data.spec.ts`：逐条校验（负/非有限数、单位不可换算、月份超期、
   更正目标缺失/已更正、因子期重叠）；**并发更正只接受一个**；
-  **重复提交幂等不重复计数**；更正链在 cut 处取链头。
+  **重复提交幂等不重复计数**；更正链在 cut 处取链头；
+- `concurrency.spec.ts`（并发回归，把导入事务**刻意保持打开**再建 cut/关账，
+  精确复现并锁定修复）：并行 6×500 条导入进行中反复建“此刻”cut，全部提交后
+  逐位重查不变；并相关账的快照行/血缘与事后按锁定口径重算一致（复现数字
+  2212 t vs 35 392 t）；并相关正同样不泄漏；手工过去时间点 cut 语义不变、
+  同时间点重复创建幂等。
 
 集成测试共用一个 PostgreSQL 库、每个测试文件持有独立连接池，因此 Jest 配置
 固定 `maxWorkers: 1`（即 `--runInBand`），避免跨文件的 `TRUNCATE ... RESTART
@@ -290,4 +361,9 @@ npm run build && npm start
 - `snapshot_rows` 主键为 `(close_id, site, source, month, scope, gas)`，
   含 `CO2/CH4/N2O/CO2E` 四行；`snapshot_lineage` 按 `(close_id, record_no, gas)`
   记录因子 id、换算到因子单位的活动量、气体质量；
+- **提交批次（迁移 0002）**：`activity_import_batches(id bigint, 序列)` 每次
+  导入事务一行；`activity_records.import_batch_id bigint NOT NULL` 指向它；
+  `activity_cuts.cut_mode` 区分 `committed`（`as_of` 为 NULL）与 `timestamp`
+  （保留 `as_of`，仅对非空值保留唯一索引）；`cut_batches(cut_id, batch_id)`
+  冻结每个 committed 型 cut 的可见批次集合；
 - 所有 id 用 `integer GENERATED ALWAYS AS IDENTITY`；计量值分子分母用 `bigint`。

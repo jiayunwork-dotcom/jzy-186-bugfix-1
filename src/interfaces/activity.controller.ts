@@ -62,15 +62,23 @@ export class ActivityController {
     };
   }
 
-  /** Register / resolve an activity-data cut-off point. */
+  /**
+   * Register / resolve an activity-data cut-off point.
+   *
+   * Without `asOf` the cut means "everything committed up to now": it freezes
+   * the set of committed import batches and is bit-identical on every later
+   * re-query even while imports/corrections keep committing. With an explicit
+   * `asOf` it keeps the historical wall-clock semantics (created_at <= asOf).
+   */
   @Post('cuts')
   createCut(@Body() body: { asOf?: string; label?: string }) {
     return body.asOf ? this.activity.createCut(body.asOf, body.label) : this.activity.createCutNow(body.label);
   }
 
   @Get('cuts/:id')
-  getCut(@Param('id') id: string) {
-    return this.activity.getCut(parseInt(id, 10));
+  async getCut(@Param('id') id: string) {
+    const cut = await this.activity.getCut(parseInt(id, 10));
+    return { id: cut.id, mode: cut.mode, asOf: cut.asOf, label: cut.label };
   }
 }
 
