@@ -27,6 +27,8 @@ import { NotFoundError } from '../common/errors';
 export interface CaliberBundle {
   caliber: Caliber;
   asOf: Date;
+  /** Microsecond-precision cut timestamp; the operative visibility bound. */
+  asOfText: string;
   factorVersion: string;
   gwpSetCode: string;
   records: ActivityRecord[];
@@ -54,16 +56,19 @@ export class AccountingService {
     if (!gwpSet.rows[0]) {
       throw new NotFoundError(`GWP set not found: ${caliber.gwpSetId}`);
     }
-    const [records, rows, props, gwpValues] = await Promise.all([
-      this.activity.getEffectiveRecords(client, cut.asOf),
-      this.factors.getFactors(client, caliber.factorVersionId),
-      this.factors.getFuelProperties(client, caliber.factorVersionId),
-      this.gwp.getValues(client, caliber.gwpSetId)
-    ]);
+    // Issue the supporting reads serially on the SAME connection: never run
+    // parallel queries against one pooled PoolClient (pg multiplexes them
+    // onto one wire and the interleaving is deprecated). The cost is three
+    // index-only scans per caliber, negligible next to the record scan.
+    const records = await this.activity.getEffectiveRecords(client, cut.asOfText);
+    const rows = await this.factors.getFactors(client, caliber.factorVersionId);
+    const props = await this.factors.getFuelProperties(client, caliber.factorVersionId);
+    const gwpValues = await this.gwp.getValues(client, caliber.gwpSetId);
     const index: FactorIndex = { rows, props, gwp: gwpValues };
     return {
       caliber,
       asOf: cut.asOf,
+      asOfText: cut.asOfText,
       factorVersion: version.version,
       gwpSetCode: gwpSet.rows[0].code,
       records,

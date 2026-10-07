@@ -47,31 +47,6 @@ export class DbService implements OnModuleDestroy {
     }
   }
 
-  /**
-   * Repeatable-read transaction. The close operation captures its three
-   * caliber references (activity cut timestamp, factor version id, GWP set
-   * id) inside the transaction and every subsequent read is explicitly
-   * filtered by those immutable references, so a factor publication or
-   * correction committed while the close is running cannot affect it. The
-   * repeatable-read snapshot additionally protects the supporting
-   * master-data reads.
-   */
-  async withSnapshotTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
-      // Advisory lock of the close grain is taken inside the service.
-      const result = await fn(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
-
   async onModuleDestroy(): Promise<void> {
     await this.pool.end();
   }

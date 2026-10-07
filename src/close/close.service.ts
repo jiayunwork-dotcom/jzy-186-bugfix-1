@@ -5,6 +5,7 @@ import {
   AccountingModule,
   AccountingService
 } from '../accounting/accounting.service';
+import { ACTIVITY_VISIBILITY_LOCK_KEY } from '../activity-data/activity-data.service';
 import { GwpModule, GwpService } from '../factor-library/gwp.service';
 import { GASES, type Gas } from '../factor-library/factor-library.service';
 import { flattenLeaves } from '../accounting/engine';
@@ -45,18 +46,47 @@ export class CloseService {
   /**
    * Monthly close — the explicit disclosure operation.
    *
-   * Isolation guarantees ("关账进行中若有人发布了新因子版本或提交了更正，
-   * 关账结果只认它开始那一刻的数据"):
-   *  1. The transaction runs on a REPEATABLE READ snapshot taken at its first
-   *     read, so master data / factor rows it reads are frozen.
+   * Isolation guarantees ("关账进行中若有人提交导入/更正/补录，快照只认关账
+   * 开始那一刻已提交的数据"，且快照永远等于按锁定口径重算):
+   *  0. The FIRST statement of the close transaction takes the activity
+   *     visibility advisory lock in EXCLUSIVE mode
+   *     (ACTIVITY_VISIBILITY_LOCK_KEY). This both:
+   *       (a) drains every import/correction transaction already in flight
+   *           (they hold the same lock shared) — only once they COMMIT does
+   *           the statement return, so everything read afterwards includes
+   *           exactly what was committed up to that point; and
+   *       (b) blocks new writers until COMMIT, so no transaction can commit a
+   *           row with created_at <= as_of AFTER the snapshot was written —
+   *           the set the snapshot stored is the very same set every future
+   *           recomputation against the locked cut derives.
+   *     The exclusive lock is held for the whole close (typically tens of
+   *     milliseconds here); imports queue rather than interleave.
+   *  1. An auto cut is created INSIDE that transaction with clock_timestamp()
+   *     only after the drain, so its as_of is later than every drained row's
+   *     created_at and earlier than every row a queued writer can stamp (its
+   *     timestamp is captured while blocked on the shared lock it only gets
+   *     at release). A caller-supplied cut (e.g. a manual historical
+   *     timestamp) keeps its as_of verbatim; the drain still closes the
+   *     in-flight gap for it.
    *  2. The three caliber references are *immutable objects*: a factor
    *     version id always points at the same rows and the activity cut is a
    *     fixed timestamp. A concurrent publish creates a *new* version id and
-   *     cannot alter the one the close holds; a correction committed after
-   *     the cut timestamp is excluded by the effective-record query.
+   *     cannot alter the one the close holds.
    *  3. A per-grain advisory lock makes concurrent closes of the same month
    *     deterministic: the second sees the first's committed row and fails
-   *     with ALREADY_CLOSED.
+   *     with ALREADY_CLOSED. Every close acquires visibility-before-grain, a
+   *     single global order, so the two locks cannot deadlock.
+   *
+   * The transaction is READ COMMITTED, not REPEATABLE READ: an RR snapshot
+   * is taken at the START of the first statement, i.e. while it is still
+   * WAITING for the exclusive lock — before the drained rows commit. That
+   * snapshot would exclude the very rows the drain waits for even though the
+   * cut (stamped after) includes them, recreating the snapshot/recompute
+   * mismatch. RC is safe here precisely because points 0-3 freeze the data:
+   * writers are blocked for the whole close, activity membership is the
+   * explicit created_at <= as_of predicate, and factors/GWP/master data are
+   * append-only objects referenced by fixed id. All per-statement RC
+   * snapshots inside one close therefore see one identical state.
    */
   async closeMonth(input: CloseMonthInput): Promise<{ closeId: number; cutId: number }> {
     if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(input.month)) {
@@ -67,7 +97,12 @@ export class CloseService {
     const monthDate = new Date(`${input.month}-01T00:00:00Z`);
     const isCompanyWide = !input.siteCode;
 
-    return this.db.withSnapshotTransaction(async (client) => {
+    // READ COMMITTED (not RR) + the exclusive visibility fence — see the
+    // method doc for why RR would snapshot before the drain completes.
+    return this.db.withTransaction(async (client) => {
+      // FIRST statement: drain + fence activity writers for the whole close.
+      await client.query('SELECT pg_advisory_xact_lock($1)', [ACTIVITY_VISIBILITY_LOCK_KEY]);
+
       // Grain lock key: company-wide closes share one key per month,
       // site closes a separate namespaced key.
       const lockKey = isCompanyWide
@@ -85,25 +120,24 @@ export class CloseService {
         throw new ConflictError('month', `${input.month} is already closed (close id ${dup.rows[0].id})`);
       }
 
-      // Resolve / create the cut inside the transaction snapshot. The cut
-      // timestamp is transaction_timestamp(): it equals the instant of the
-      // first statement in this repeatable-read transaction, so (a) the
-      // effective-record SQL cannot see rows committed afterwards, and (b) a
-      // future on-demand recomputation against this very cut id applies the
-      // same created_at <= as_of bound and reaches the same set. Using
-      // clock_timestamp() here would let a correction committed mid-close be
-      // snapshot-invisible now but visible in a later recomputation.
+      // Auto cut: stamp now that the drain has happened and writers are
+      // fenced. A caller-supplied cut is validated and otherwise untouched
+      // (manual historical cuts keep their meaning).
       let cutId = input.cutId;
-      if (!cutId) {
+      if (cutId === undefined) {
         const r = await client.query<{ id: number }>(
           `INSERT INTO activity_cuts(label, as_of)
-           VALUES ($1, now()) RETURNING id, as_of`,
+           VALUES ($1, clock_timestamp()) RETURNING id, as_of`,
           [`close ${input.month}${input.siteCode ? ` ${input.siteCode}` : ''}`]
         );
         cutId = r.rows[0].id;
+      } else {
+        const cutCheck = await client.query<{ id: number }>(
+          'SELECT id FROM activity_cuts WHERE id = $1',
+          [cutId]
+        );
+        if (!cutCheck.rows[0]) throw new NotFoundError(`activity cut ${cutId} not found`);
       }
-
-      // Validate the other caliber objects under the same snapshot.
       const fv = await client.query<{ id: number }>('SELECT id FROM factor_versions WHERE id = $1', [
         input.factorVersionId
       ]);

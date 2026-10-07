@@ -1,5 +1,5 @@
 import { Injectable, Module } from '@nestjs/common';
-import { DbModule, DbService } from '../database/database.module';
+import { DbModule, DbService, type Queryer } from '../database/database.module';
 
 export interface Site {
   code: string;
@@ -39,7 +39,19 @@ export class MasterDataService {
   }
 
   async getSource(siteCode: string, code: string): Promise<EmissionSource | null> {
-    const res = await this.db.query<{
+    return this.getSourceOn(this.db, siteCode, code);
+  }
+
+  /**
+   * Transaction-scoped variant. Code running inside withTransaction MUST use
+   * this (not getSource): otherwise the inner read checks out a *second*
+   * client from the global pool while the outer transaction keeps holding
+   * one, which self-deadlocks the pool once enough transactions are open
+   * (each open transaction consumes 2 of N pool slots and can wait forever
+   * for the second while holding the first).
+   */
+  async getSourceOn(client: Queryer, siteCode: string, code: string): Promise<EmissionSource | null> {
+    const res = await client.query<{
       site_code: string;
       code: string;
       name: string;

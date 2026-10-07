@@ -49,6 +49,33 @@ export interface BulkImportInput {
 
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
+/**
+ * Single 64-bit advisory-lock namespace guarding activity-data visibility.
+ *
+ * - Every transaction that inserts activity rows (bulk import, corrections)
+ *   takes the lock in SHARED mode: imports run fully concurrently with each
+ *   other.
+ * - Creating a "now" cut takes it in EXCLUSIVE mode inside a short
+ *   transaction: the cut cannot be stamped until every import already in
+ *   flight has committed and released. New imports starting afterwards run
+ *   their INSERT (and therefore take clock_timestamp()) only after the cut
+ *   transaction released the lock, so their rows stamp strictly after the
+ *   cut. Together with created_at = clock_timestamp() this makes
+ *   `created_at <= cut.as_of` a stable, commit-ordered membership predicate.
+ */
+export const ACTIVITY_VISIBILITY_LOCK_KEY = hashLockKey('activity-data:visibility:v1');
+
+/** FNV-1a 64, mapped into the signed bigint range pg_advisory_lock expects. */
+function hashLockKey(s: string): bigint {
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < s.length; i++) {
+    h ^= BigInt(s.charCodeAt(i));
+    h = BigInt.asUintN(64, h * 0x100000001b3n);
+  }
+  if (h > 0x7fffffffffffffffn) h -= 0x10000000000000000n;
+  return h;
+}
+
 interface StoredRecord {
   record_no: string;
   site_code: string;
@@ -105,6 +132,7 @@ export class ActivityDataService {
   // --------------------------------------------------------------------------
 
   private async validateRecord(
+    client: Queryer,
     rec: ActivityInput,
     index: number,
     opts: {
@@ -155,7 +183,7 @@ export class ActivityDataService {
 
     const source =
       rec.siteCode && rec.sourceCode
-        ? await this.masterData.getSource(rec.siteCode, rec.sourceCode)
+        ? await this.masterData.getSourceOn(client, rec.siteCode, rec.sourceCode)
         : null;
     if (rec.siteCode && rec.sourceCode && !source) {
       errors.push({
@@ -253,12 +281,30 @@ export class ActivityDataService {
     });
 
     await this.db.withTransaction(async (client) => {
+      // Join the import cohort. All writers hold the lock in shared mode, so
+      // an exclusive "now"-cut/close in another session waits for the whole
+      // cohort (and each writer waits for a cut) — see
+      // ACTIVITY_VISIBILITY_LOCK_KEY.
+      await client.query('SELECT pg_advisory_xact_lock_shared($1)', [ACTIVITY_VISIBILITY_LOCK_KEY]);
+      // Capture the batch visibility time IMMEDIATELY, as MICROSECOND TEXT,
+      // while holding the shared lock; every row of this batch is stamped
+      // with it. Text is essential: round-tripping through a JS Date would
+      // truncate to milliseconds and misplace rows stamped in the same
+      // millisecond as a concurrent cut. The stamp is not deferred to INSERT
+      // execution (which happens after validation): a cut whose exclusive
+      // lock interleaves into that gap must either drain this whole batch
+      // (batch stamp < cut as_of) or fence it out as a whole (stamp >).
+      const stamped = await client.query<{ ts: string }>(
+        'SELECT clock_timestamp()::text AS ts'
+      );
+      const batchTs = stamped.rows[0].ts;
+
       // Factor context for optional cross-validation. Density/NCV are
       // versioned per fuel; resolved per record from this map.
       let factorRows: FactorRow[] | undefined;
       let fuelProps: Map<string, { density: Fraction | null; ncv: Fraction | null }> | undefined;
       if (input.validateAgainstFactorVersion !== undefined) {
-        const v = await this.factors.getVersion(input.validateAgainstFactorVersion);
+        const v = await this.factors.getVersionOn(client, input.validateAgainstFactorVersion);
         factorRows = await this.factors.getFactors(client, v.id);
         fuelProps = await this.factors.getFuelProperties(client, v.id);
       }
@@ -362,7 +408,7 @@ export class ActivityDataService {
             }
           : undefined;
 
-        const v = await this.validateRecord(rec, i, {
+        const v = await this.validateRecord(client, rec, i, {
           factorRows,
           factorDensity: (() => {
             const p = rec.fuelKey ? fuelProps?.get(rec.fuelKey) : undefined;
@@ -383,8 +429,9 @@ export class ActivityDataService {
         await client.query(
           `INSERT INTO activity_records
              (record_no, site_code, source_code, month, fuel_key, scope,
-              quantity_num, quantity_den, unit, is_correction, supersedes_record_no)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              quantity_num, quantity_den, unit, is_correction,
+              supersedes_record_no, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz)`,
           [
             rec.recordNo,
             rec.siteCode,
@@ -396,7 +443,8 @@ export class ActivityDataService {
             qty.den,
             rec.unit,
             rec.supersedesRecordNo ? true : false,
-            rec.supersedesRecordNo ?? null
+            rec.supersedesRecordNo ?? null,
+            batchTs
           ]
         );
       }
@@ -463,56 +511,82 @@ export class ActivityDataService {
   // Cut-off points
   // --------------------------------------------------------------------------
 
-  async createCut(asOfIso: string, label?: string): Promise<{ id: number; asOf: Date }> {
+  async createCut(asOfIso: string, label?: string): Promise<{ id: number; asOf: Date; asOfText: string }> {
     const asOf = new Date(asOfIso);
     if (Number.isNaN(asOf.getTime())) {
       throw new ValidationException([{ field: 'asOf', code: 'INVALID_VALUE', message: 'bad ISO timestamp' }]);
     }
+    // Pass the timestamp as TEXT, never as a JS Date: the pg driver encodes a
+    // Date at millisecond precision, which would truncate the user's (or
+    // clock_timestamp()'s) microseconds and shift the visibility boundary.
     try {
-      const res = await this.db.query<{ id: number; as_of: Date }>(
-        'INSERT INTO activity_cuts(label, as_of) VALUES ($1, $2) RETURNING id, as_of',
-        [label ?? null, asOf]
+      const res = await this.db.query<{ id: number; as_of: Date; as_of_text: string }>(
+        `INSERT INTO activity_cuts(label, as_of)
+         VALUES ($1, $2::timestamptz) RETURNING id, as_of, as_of::text AS as_of_text`,
+        [label ?? null, asOfIso]
       );
-      return { id: res.rows[0].id, asOf: res.rows[0].as_of };
+      return { id: res.rows[0].id, asOf: res.rows[0].as_of, asOfText: res.rows[0].as_of_text };
     } catch (e) {
       if ((e as { code?: string }).code === '23505') {
-        const res = await this.db.query<{ id: number; as_of: Date }>(
-          'SELECT id, as_of FROM activity_cuts WHERE as_of = $1',
-          [asOf]
+        const res = await this.db.query<{ id: number; as_of: Date; as_of_text: string }>(
+          `SELECT id, as_of, as_of::text AS as_of_text FROM activity_cuts WHERE as_of = $1::timestamptz`,
+          [asOfIso]
         );
-        return { id: res.rows[0].id, asOf: res.rows[0].as_of };
+        return { id: res.rows[0].id, asOf: res.rows[0].as_of, asOfText: res.rows[0].as_of_text };
       }
       throw e;
     }
   }
 
-  /** Convenience: a cut meaning "everything committed up to now". */
-  async createCutNow(label?: string): Promise<{ id: number; asOf: Date }> {
+  /**
+   * Convenience cut meaning "everything committed up to now — a stable set".
+   *
+   * Implemented as a tiny dedicated transaction (NOT inside a long-lived
+   * business transaction):
+   *  1. take ACTIVITY_VISIBILITY_LOCK_KEY exclusively, so the statement
+   *     blocks until every import/correction transaction already in flight
+   *     has COMMITted (they hold it shared);
+   *  2. stamp as_of = clock_timestamp() and COMMIT.
+   *
+   * Because activity rows stamp created_at (in microsecond text, captured
+   * while holding the shared lock) relative to that boundary, at COMMIT of
+   * this transaction every row with created_at <= as_of is already
+   * committed and every future committed row has created_at > as_of.
+   * Queries against this cut at any later time see the same record set,
+   * regardless of imports/corrections still arriving.
+   */
+  async createCutNow(label?: string): Promise<{ id: number; asOf: Date; asOfText: string }> {
     return this.db.withTransaction(async (client) => {
-      const res = await client.query<{ id: number; as_of: Date }>(
+      await client.query('SELECT pg_advisory_xact_lock($1)', [ACTIVITY_VISIBILITY_LOCK_KEY]);
+      const res = await client.query<{ id: number; as_of: Date; as_of_text: string }>(
         `INSERT INTO activity_cuts(label, as_of)
          VALUES ($1, clock_timestamp())
-         RETURNING id, as_of`,
+         RETURNING id, as_of, as_of::text AS as_of_text`,
         [label ?? null]
       );
-      return { id: res.rows[0].id, asOf: res.rows[0].as_of };
+      return { id: res.rows[0].id, asOf: res.rows[0].as_of, asOfText: res.rows[0].as_of_text };
     });
   }
 
-  async getCut(id: number): Promise<{ id: number; asOf: Date; label: string | null }> {
+  async getCut(id: number): Promise<{ id: number; asOf: Date; asOfText: string; label: string | null }> {
     return this.getCutOn(this.db, id);
   }
 
   async getCutOn(
     client: Queryer,
     id: number
-  ): Promise<{ id: number; asOf: Date; label: string | null }> {
-    const res = await client.query<{ id: number; as_of: Date; label: string | null }>(
-      'SELECT id, as_of, label FROM activity_cuts WHERE id = $1',
+  ): Promise<{ id: number; asOf: Date; asOfText: string; label: string | null }> {
+    const res = await client.query<{ id: number; as_of: Date; as_of_text: string; label: string | null }>(
+      `SELECT id, as_of, as_of::text AS as_of_text, label FROM activity_cuts WHERE id = $1`,
       [id]
     );
     if (!res.rows[0]) throw new NotFoundError(`activity cut not found: ${id}`);
-    return { id: res.rows[0].id, asOf: res.rows[0].as_of, label: res.rows[0].label };
+    return {
+      id: res.rows[0].id,
+      asOf: res.rows[0].as_of,
+      asOfText: res.rows[0].as_of_text,
+      label: res.rows[0].label
+    };
   }
 
   /**
@@ -520,21 +594,26 @@ export class ActivityDataService {
    * whose created_at <= as_of (NOT EXISTS a successor visible by the cut).
    * Records created after the cut are invisible even if they correct a visible
    * record — this is exactly what "活动数据截止点" means.
+   *
+   * `asOfText` is the cut timestamp in PostgreSQL's text form (microsecond
+   * precision). It MUST be passed as text: a JS Date would truncate it to
+   * milliseconds and rows stamped inside the same millisecond as the cut
+   * would be classified inconsistently.
    */
-  async getEffectiveRecords(client: Queryer, asOf: Date): Promise<ActivityRecord[]> {
+  async getEffectiveRecords(client: Queryer, asOfText: string): Promise<ActivityRecord[]> {
     const res = await client.query<StoredRecord>(
       `SELECT r.record_no, r.site_code, r.source_code, r.month, r.fuel_key,
               r.scope, r.quantity_num, r.quantity_den, r.unit, r.is_correction,
               r.supersedes_record_no, r.created_at
        FROM activity_records r
-       WHERE r.created_at <= $1
+       WHERE r.created_at <= $1::timestamptz
          AND NOT EXISTS (
              SELECT 1 FROM activity_records s
              WHERE s.supersedes_record_no = r.record_no
-               AND s.created_at <= $1
+               AND s.created_at <= $1::timestamptz
          )
        ORDER BY r.record_no`,
-      [asOf]
+      [asOfText]
     );
     return res.rows.map(hydrate);
   }
